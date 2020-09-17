@@ -208,7 +208,7 @@ type trial struct {
 	lastContainerConnectedTime time.Time
 	startedContainers          map[cproto.ID]bool
 	containers                 map[cproto.ID]cproto.Container // only for running containers.
-	containerRank              map[cproto.ID]int              // only for running containers.
+	containerRanks             map[cproto.ID]int              // only for running containers.
 	containerAddresses         map[cproto.ID][]cproto.Address // only for running containers.
 	containerSockets           map[cproto.ID]*actor.Ref       // only for running containers.
 	terminatedContainers       map[cproto.ID]terminatedContainerWithState
@@ -246,7 +246,7 @@ func newTrial(
 
 		startedContainers:    make(map[cproto.ID]bool),
 		containers:           make(map[cproto.ID]cproto.Container),
-		containerRank:        make(map[cproto.ID]int),
+		containerRanks:       make(map[cproto.ID]int),
 		containerAddresses:   make(map[cproto.ID][]cproto.Address),
 		containerSockets:     make(map[cproto.ID]*actor.Ref),
 		terminatedContainers: make(map[cproto.ID]terminatedContainerWithState),
@@ -351,7 +351,8 @@ func (t *trial) Receive(ctx *actor.Context) error {
 			ctx.Tell(t.rp, *t.task)
 		}
 	} else if t.experimentState != model.ActiveState {
-		_ = t.processReleaseResource(ctx)
+		ctx.Log().Info("releasing resources because the experiment is not active")
+		_ = t.releaseResource(ctx)
 	}
 
 	return nil
@@ -383,9 +384,11 @@ func (t *trial) runningReceive(ctx *actor.Context) error {
 		}
 
 	case actor.ChildFailed:
+		ctx.Log().Info("found child actor failed, terminating forcibly")
 		t.terminate(ctx, true)
 
 	case killTrial:
+		ctx.Log().Info("received killing request")
 		t.killed = true
 		t.terminate(ctx, true)
 
@@ -424,7 +427,8 @@ func (t *trial) processSchedulerMsg(ctx *actor.Context) error {
 		}
 
 	case scheduler.ReleaseResources:
-		return t.processReleaseResource(ctx)
+		ctx.Log().Info("releasing resources because of being preempted")
+		return t.releaseResource(ctx)
 
 	default:
 		return actor.ErrUnexpectedMessage(ctx)
@@ -432,7 +436,7 @@ func (t *trial) processSchedulerMsg(ctx *actor.Context) error {
 	return nil
 }
 
-func (t *trial) processReleaseResource(ctx *actor.Context) error {
+func (t *trial) releaseResource(ctx *actor.Context) error {
 	if !t.allReady(ctx) {
 		t.cancelUnready = true
 		t.terminate(ctx, true)
@@ -592,7 +596,8 @@ func (t *trial) processAllocated(ctx *actor.Context, msg scheduler.ResourcesAllo
 		),
 	}
 
-	for _, a := range msg.Allocations {
+	for rank, a := range msg.Allocations {
+		t.containerRanks[a.Summary().ID] = rank
 		taskSpec := *t.taskSpec
 		taskSpec.StartContainer = &tasks.StartContainer{
 			ExperimentConfig:    t.experiment.Config,
@@ -605,6 +610,7 @@ func (t *trial) processAllocated(ctx *actor.Context, msg scheduler.ResourcesAllo
 			AdditionalFiles:     additionalFiles,
 			AgentUserGroup:      t.agentUserGroup,
 			IsMultiAgent:        len(t.allocations) > 1,
+			Rank:                rank,
 		}
 		a.StartContainer(ctx, taskSpec)
 	}
@@ -683,6 +689,7 @@ func (t *trial) sendNextWorkload(ctx *actor.Context) error {
 
 	// We have nothing at all to do, so terminate now.
 	default:
+		ctx.Log().Info("terminating gracefully because there is no more workloads")
 		terminateNow = true
 		t.terminate(ctx, false)
 	}
@@ -796,6 +803,7 @@ func (t *trial) pushRendezvous(ctx *actor.Context) error {
 		ctx.Log().Info("found not all containers are connected")
 		return nil
 	}
+	ctx.Log().Info("found all containers are connected successfully")
 
 	type CAddress struct {
 		Container cproto.Container
@@ -808,7 +816,7 @@ func (t *trial) pushRendezvous(ctx *actor.Context) error {
 		caddr := CAddress{
 			Container: v,
 			Addresses: t.containerAddresses[k],
-			Ordinal:   t.containerRank[k],
+			Ordinal:   t.containerRanks[k],
 		}
 		caddrs = append(caddrs, caddr)
 
@@ -867,7 +875,7 @@ func (t *trial) pushRendezvous(ctx *actor.Context) error {
 		})
 	}
 
-	for rank, caddr := range caddrs {
+	for _, caddr := range caddrs {
 		c := caddr.Container
 		socket := t.containerSockets[c.ID]
 
@@ -875,7 +883,7 @@ func (t *trial) pushRendezvous(ctx *actor.Context) error {
 			RendezvousInfo: &rendezvousInfoMessage{
 				Addrs:      addrs1,
 				Addrs2:     addrs2,
-				Rank:       rank,
+				Rank:       caddr.Ordinal,
 				Containers: rcontainers,
 			},
 		}); err != nil {
@@ -890,11 +898,10 @@ func (t *trial) processContainerRunning(
 	ctx *actor.Context, msg sproto.TaskContainerStateChanged,
 ) error {
 	ctx.Log().Infof("found container running: %s (rank %d)",
-		msg.Container.ID, len(t.containerRank))
+		msg.Container.ID, t.containerRanks[msg.Container.ID])
 
 	t.containers[msg.Container.ID] = msg.Container
 	t.containerAddresses[msg.Container.ID] = msg.ContainerStarted.Addresses
-	t.containerRank[msg.Container.ID] = len(t.containerRank)
 	if err := t.pushRendezvous(ctx); err != nil {
 		return errors.Wrap(err, "failed to push rendezvous to trial containers")
 	}
@@ -904,9 +911,10 @@ func (t *trial) processContainerRunning(
 func (t *trial) processContainerTerminated(
 	ctx *actor.Context, msg sproto.TaskContainerStateChanged,
 ) {
+	ctx.Log().Infof("found container terminated: %s", msg.Container.ID)
 	t.terminatedContainers[msg.Container.ID] = terminatedContainerWithState{
 		exitStatus:                 *msg.ContainerStopped,
-		isLeader:                   t.containerRank[msg.Container.ID] == 0,
+		isLeader:                   t.containerRanks[msg.Container.ID] == 0,
 		pendingGracefulTermination: t.pendingGracefulTermination,
 		needsCheckpoint:            t.sequencer.PrecloseCheckpointWorkload() != nil,
 	}
@@ -914,7 +922,6 @@ func (t *trial) processContainerTerminated(
 	_, ok := t.containers[msg.Container.ID]
 	delete(t.containers, msg.Container.ID)
 	delete(t.containerAddresses, msg.Container.ID)
-	delete(t.containerRank, msg.Container.ID)
 
 	t.killAndRemoveSocket(ctx, msg.Container.ID)
 
@@ -928,7 +935,7 @@ func (t *trial) processContainerTerminated(
 	// Terminate the task if the container never started (since this prevents the gang
 	// from ever being able to start), if the leader of the gang has exited out, or if
 	// one of the containers exited with a failure.
-	if !ok || t.containerRank[msg.Container.ID] == 0 || msg.ContainerStopped.Failure != nil {
+	if !ok || t.containerRanks[msg.Container.ID] == 0 || msg.ContainerStopped.Failure != nil {
 		t.terminate(ctx, true)
 	}
 
@@ -1043,8 +1050,12 @@ func (t *trial) terminated(ctx *actor.Context) {
 	terminationSent := t.terminationSent
 
 	t.runID++
+
 	t.task = nil
+	t.allocations = nil
+	t.containerRanks = make(map[cproto.ID]int)
 	ctx.Tell(t.rp, scheduler.ResourcesReleased{TaskActor: ctx.Self()})
+
 	t.pendingGracefulTermination = false
 	t.terminationSent = false
 	t.terminatedContainers = make(map[cproto.ID]terminatedContainerWithState)
